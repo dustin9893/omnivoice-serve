@@ -230,43 +230,52 @@ def run_batch_inference(
 ) -> list[np.ndarray]:
     """Run true batched inference — single forward pass for N texts.
 
-    OmniVoice model.generate() accepts:
-      text: Union[str, list[str]]
-      language: Union[str, list[str], None]
-      voice_clone_prompt: VoiceClonePrompt (reusable, no audio reload)
-    Returns list[np.ndarray] where each array is shape (T,) at model.sampling_rate.
+    OmniVoice natively accepts list[VoiceClonePrompt] — one per text item.
+    Constraint: chunked inference requires ALL or NONE to have ref audio.
+    Mixed batches (some with voice, some without) are split and run separately.
     """
-    # If all items share the same non-None prompt, pass it directly (common case)
-    # Otherwise run individually to handle mixed prompts
-    if voice_prompts and any(p is not None for p in voice_prompts):
-        # Run each item separately when prompts differ (can't batch mixed prompts)
-        unique_prompts = list(set(id(p) for p in voice_prompts if p is not None))
-        if len(unique_prompts) == 1 and all(p is not None for p in voice_prompts):
-            # All same prompt → single batched forward pass
-            audios = model.generate(
-                text=texts,
-                language=languages,
-                voice_clone_prompt=voice_prompts[0],
-                num_step=NUM_STEP,
-            )
-        else:
-            # Mixed prompts → one call per item
-            audios = []
-            for text, lang, prompt in zip(texts, languages, voice_prompts):
-                result = model.generate(
-                    text=text,
-                    language=lang,
-                    voice_clone_prompt=prompt,
-                    num_step=NUM_STEP,
-                )
-                audios.append(result[0])
-    else:
-        audios = model.generate(
+    has_voice = [p is not None for p in (voice_prompts or [])]
+
+    # Case 1: No voice cloning at all
+    if not voice_prompts or not any(has_voice):
+        return model.generate(text=texts, language=languages, num_step=NUM_STEP)
+
+    # Case 2: All items have voice → pass list directly (native batch support)
+    if all(has_voice):
+        return model.generate(
             text=texts,
             language=languages,
+            voice_clone_prompt=voice_prompts,   # list[VoiceClonePrompt]
             num_step=NUM_STEP,
         )
-    return audios
+
+    # Case 3: Mixed batch — split to avoid chunked inference assertion
+    # Run voiced and non-voiced groups separately, then re-interleave
+    voiced_idx   = [i for i, h in enumerate(has_voice) if h]
+    unvoiced_idx = [i for i, h in enumerate(has_voice) if not h]
+
+    results = [None] * len(texts)
+
+    if voiced_idx:
+        voiced_audios = model.generate(
+            text=[texts[i] for i in voiced_idx],
+            language=[languages[i] for i in voiced_idx],
+            voice_clone_prompt=[voice_prompts[i] for i in voiced_idx],
+            num_step=NUM_STEP,
+        )
+        for idx, audio in zip(voiced_idx, voiced_audios):
+            results[idx] = audio
+
+    if unvoiced_idx:
+        unvoiced_audios = model.generate(
+            text=[texts[i] for i in unvoiced_idx],
+            language=[languages[i] for i in unvoiced_idx],
+            num_step=NUM_STEP,
+        )
+        for idx, audio in zip(unvoiced_idx, unvoiced_audios):
+            results[idx] = audio
+
+    return results
 
 
 async def batch_worker():
