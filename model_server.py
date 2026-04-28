@@ -28,10 +28,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
+import hashlib
+import shutil
 import numpy as np
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from prometheus_client import Counter, Gauge, Histogram, Info
 from pydantic import BaseModel, Field
 
@@ -44,6 +46,7 @@ BATCH_WINDOW_MS = int(os.environ.get("BATCH_WINDOW_MS", "50"))
 MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "64"))
 NUM_STEP = int(os.environ.get("NUM_STEP", "16"))
 USE_TORCH_COMPILE = os.environ.get("USE_TORCH_COMPILE", "true").lower() == "true"
+VOICES_DIR = os.environ.get("VOICES_DIR", "./voices")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,9 +58,9 @@ logger = logging.getLogger(__name__)
 # ─── Request / Response Models ────────────────────────────
 class TTSRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=10_000)
-    voice: Optional[str] = None
-    instruct: Optional[str] = None
-    ref_audio_path: Optional[str] = None
+    voice_id: Optional[str] = None       # ← registered voice clone ID
+    instruct: Optional[str] = None       # ← voice design mode
+    ref_audio_path: Optional[str] = None # ← one-off voice clone (no pre-register)
     ref_text: Optional[str] = None
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
     language: str = Field(default="en")
@@ -66,12 +69,19 @@ class TTSRequest(BaseModel):
 class TTSBatchRequest(BaseModel):
     """Multiple texts to process in a single forward pass."""
     texts: list[str] = Field(..., min_length=1)
-    voice: Optional[str] = None
+    voice_id: Optional[str] = None
     instruct: Optional[str] = None
     ref_audio_path: Optional[str] = None
     ref_text: Optional[str] = None
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
     language: str = Field(default="en")
+
+
+class VoiceRegisterResponse(BaseModel):
+    voice_id: str
+    name: str
+    ref_text: str
+    duration_s: float
 
 
 class TTSResponse(BaseModel):
@@ -156,6 +166,10 @@ model = None
 batch_queue: asyncio.Queue = None
 executor: ThreadPoolExecutor = None
 
+# Voice clone cache: voice_id → VoiceClonePrompt (in-memory)
+voice_cache: dict = {}
+voice_meta: dict = {}   # voice_id → {name, ref_text, duration_s}
+
 
 def load_model():
     """Load OmniVoice model onto assigned GPU with optional torch.compile."""
@@ -186,19 +200,72 @@ def load_model():
     })
 
 
-def run_batch_inference(texts: list[str], languages: list[str]) -> list[np.ndarray]:
+def load_persisted_voices():
+    """Load all .pt voice prompts saved to VOICES_DIR on startup."""
+    os.makedirs(VOICES_DIR, exist_ok=True)
+    count = 0
+    for pt_file in os.listdir(VOICES_DIR):
+        if not pt_file.endswith(".pt"):
+            continue
+        voice_id = pt_file[:-3]
+        try:
+            data = torch.load(os.path.join(VOICES_DIR, pt_file), map_location="cpu")
+            from omnivoice.models.omnivoice import VoiceClonePrompt
+            voice_cache[voice_id] = VoiceClonePrompt(
+                ref_audio_tokens=data["ref_audio_tokens"],
+                ref_text=data["ref_text"],
+                ref_rms=data["ref_rms"],
+            )
+            voice_meta[voice_id] = data.get("meta", {"name": voice_id})
+            count += 1
+        except Exception as e:
+            logger.warning(f"Failed to load voice {voice_id}: {e}")
+    logger.info(f"Loaded {count} persisted voice(s) from {VOICES_DIR}")
+
+
+def run_batch_inference(
+    texts: list[str],
+    languages: list[str],
+    voice_prompts: list = None,   # list[VoiceClonePrompt | None]
+) -> list[np.ndarray]:
     """Run true batched inference — single forward pass for N texts.
 
     OmniVoice model.generate() accepts:
       text: Union[str, list[str]]
       language: Union[str, list[str], None]
+      voice_clone_prompt: VoiceClonePrompt (reusable, no audio reload)
     Returns list[np.ndarray] where each array is shape (T,) at model.sampling_rate.
     """
-    audios = model.generate(
-        text=texts,
-        language=languages,
-        num_step=NUM_STEP,
-    )
+    # If all items share the same non-None prompt, pass it directly (common case)
+    # Otherwise run individually to handle mixed prompts
+    if voice_prompts and any(p is not None for p in voice_prompts):
+        # Run each item separately when prompts differ (can't batch mixed prompts)
+        unique_prompts = list(set(id(p) for p in voice_prompts if p is not None))
+        if len(unique_prompts) == 1 and all(p is not None for p in voice_prompts):
+            # All same prompt → single batched forward pass
+            audios = model.generate(
+                text=texts,
+                language=languages,
+                voice_clone_prompt=voice_prompts[0],
+                num_step=NUM_STEP,
+            )
+        else:
+            # Mixed prompts → one call per item
+            audios = []
+            for text, lang, prompt in zip(texts, languages, voice_prompts):
+                result = model.generate(
+                    text=text,
+                    language=lang,
+                    voice_clone_prompt=prompt,
+                    num_step=NUM_STEP,
+                )
+                audios.append(result[0])
+    else:
+        audios = model.generate(
+            text=texts,
+            language=languages,
+            num_step=NUM_STEP,
+        )
     return audios
 
 
@@ -248,11 +315,16 @@ async def batch_worker():
         try:
             texts = [item.request.text for item in batch]
             langs = [item.request.language for item in batch]
+            prompts = [
+                voice_cache.get(item.request.voice_id)
+                if item.request.voice_id else None
+                for item in batch
+            ]
 
             # Run inference in thread pool (blocking GPU call)
             loop = asyncio.get_event_loop()
             audios = await loop.run_in_executor(
-                executor, run_batch_inference, texts, langs
+                executor, run_batch_inference, texts, langs, prompts
             )
 
             batch_latency = (time.monotonic() - batch_start) * 1000
@@ -302,12 +374,113 @@ async def startup():
     global batch_queue, executor
 
     load_model()
+    load_persisted_voices()
 
     batch_queue = asyncio.Queue(maxsize=200)
     executor = ThreadPoolExecutor(max_workers=1)  # 1 GPU = 1 thread
 
     asyncio.create_task(batch_worker())
     logger.info(f"Server ready on port {WORKER_PORT}")
+
+
+# ─── Voice Clone Endpoints ────────────────────────────────
+@app.post("/voices", response_model=VoiceRegisterResponse)
+async def register_voice(
+    name: str,
+    file: UploadFile = File(...),
+    ref_text: Optional[str] = None,
+):
+    """Upload a reference audio file to create a reusable voice clone.
+
+    - Saves audio to VOICES_DIR/{voice_id}.wav
+    - Creates VoiceClonePrompt (tokenizes audio → tensor)
+    - Persists prompt to VOICES_DIR/{voice_id}.pt (survives restart)
+    - Returns voice_id for use in /infer and /infer_batch
+    """
+    from omnivoice.models.omnivoice import VoiceClonePrompt  # noqa
+
+    os.makedirs(VOICES_DIR, exist_ok=True)
+
+    # Read uploaded file
+    audio_bytes = await file.read()
+
+    # Generate deterministic voice_id from content hash + name
+    content_hash = hashlib.sha256(audio_bytes).hexdigest()[:12]
+    voice_id = f"{name}_{content_hash}"
+
+    audio_path = os.path.join(VOICES_DIR, f"{voice_id}.wav")
+    pt_path = os.path.join(VOICES_DIR, f"{voice_id}.pt")
+
+    # Save audio to disk
+    with open(audio_path, "wb") as f:
+        f.write(audio_bytes)
+
+    # Create VoiceClonePrompt (tokenize audio → tensor, extract ref_text via Whisper if needed)
+    loop = asyncio.get_event_loop()
+    prompt = await loop.run_in_executor(
+        executor,
+        model.create_voice_clone_prompt,
+        audio_path,
+        ref_text,
+    )
+
+    # Cache in memory
+    voice_cache[voice_id] = prompt
+    meta = {
+        "name": name,
+        "ref_text": prompt.ref_text,
+        "duration_s": round(
+            prompt.ref_audio_tokens.shape[-1] / model.audio_tokenizer.config.frame_rate, 2
+        ),
+    }
+    voice_meta[voice_id] = meta
+
+    # Persist to disk (survives restart)
+    torch.save({
+        "ref_audio_tokens": prompt.ref_audio_tokens.cpu(),
+        "ref_text": prompt.ref_text,
+        "ref_rms": prompt.ref_rms,
+        "meta": meta,
+    }, pt_path)
+
+    logger.info(f"Voice registered: {voice_id} (ref_text='{prompt.ref_text[:50]}...'")
+
+    return VoiceRegisterResponse(
+        voice_id=voice_id,
+        name=name,
+        ref_text=prompt.ref_text,
+        duration_s=meta["duration_s"],
+    )
+
+
+@app.get("/voices")
+async def list_voices():
+    """List all registered voice clones."""
+    return {
+        "voices": [
+            {"voice_id": vid, **meta}
+            for vid, meta in voice_meta.items()
+        ],
+        "total": len(voice_meta),
+    }
+
+
+@app.delete("/voices/{voice_id}")
+async def delete_voice(voice_id: str):
+    """Remove a registered voice clone from cache and disk."""
+    if voice_id not in voice_cache:
+        raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found")
+
+    voice_cache.pop(voice_id)
+    voice_meta.pop(voice_id, None)
+
+    # Remove persisted files
+    for ext in (".pt", ".wav"):
+        path = os.path.join(VOICES_DIR, f"{voice_id}{ext}")
+        if os.path.exists(path):
+            os.remove(path)
+
+    return {"deleted": voice_id}
 
 
 @app.post("/infer", response_model=TTSResponse)
