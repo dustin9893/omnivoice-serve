@@ -223,6 +223,40 @@ def load_persisted_voices():
     logger.info(f"Loaded {count} persisted voice(s) from {VOICES_DIR}")
 
 
+def _resolve_voice(voice_id: str):
+    """Lookup voice from RAM cache; lazy-load from shared disk on miss.
+
+    Handles cross-instance case:
+      - Instance 0 registers voice → writes .pt to shared volume
+      - Instance 1 gets request → cache miss → loads .pt from shared volume
+      - Caches in RAM → subsequent requests are fast
+    """
+    if voice_id in voice_cache:
+        return voice_cache[voice_id]
+
+    # Cache miss — try loading from shared volume (another instance may have written it)
+    pt_path = os.path.join(VOICES_DIR, f"{voice_id}.pt")
+    if not os.path.exists(pt_path):
+        logger.warning(f"Voice '{voice_id}' not found in cache or disk")
+        return None
+
+    try:
+        from omnivoice.models.omnivoice import VoiceClonePrompt
+        data = torch.load(pt_path, map_location="cpu")
+        prompt = VoiceClonePrompt(
+            ref_audio_tokens=data["ref_audio_tokens"],
+            ref_text=data["ref_text"],
+            ref_rms=data["ref_rms"],
+        )
+        voice_cache[voice_id] = prompt
+        voice_meta[voice_id] = data.get("meta", {"name": voice_id})
+        logger.info(f"Lazy-loaded voice '{voice_id}' from disk into cache")
+        return prompt
+    except Exception as e:
+        logger.error(f"Failed to lazy-load voice '{voice_id}': {e}")
+        return None
+
+
 def run_batch_inference(
     texts: list[str],
     languages: list[str],
@@ -325,7 +359,7 @@ async def batch_worker():
             texts = [item.request.text for item in batch]
             langs = [item.request.language for item in batch]
             prompts = [
-                voice_cache.get(item.request.voice_id)
+                _resolve_voice(item.request.voice_id)
                 if item.request.voice_id else None
                 for item in batch
             ]
